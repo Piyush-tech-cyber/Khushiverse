@@ -1,21 +1,23 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import yt_dlp
+import requests
 import os
-import tempfile
 
 app = Flask(__name__)
 CORS(app)
 
-DOWNLOAD_FOLDER = tempfile.gettempdir()
+# Cobalt API - Free, no key needed
+COBALT_API = "https://api.cobalt.tools"
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
 }
 
 @app.route('/')
 def home():
     return jsonify({"status": "Khushiverse API running! 🌸"})
+
 
 @app.route('/api/info', methods=['POST'])
 def get_info():
@@ -24,44 +26,47 @@ def get_info():
     if not url:
         return jsonify({"error": "URL required"}), 400
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'http_headers': HEADERS,
-        'extractor_args': {'youtube': {'skip': ['dash', 'hls']}},
-    }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = []
-            seen = set()
-            formats.append({"label": "MP3", "ext": "mp3", "format_id": "bestaudio", "type": "audio"})
-            for f in (info.get('formats') or []):
-                height = f.get('height')
-                ext = f.get('ext', 'mp4')
-                fid = f.get('format_id')
-                if height and height not in seen and ext in ['mp4', 'webm']:
-                    seen.add(height)
-                    formats.append({
-                        "label": f"{height}p",
-                        "ext": "mp4",
-                        "format_id": fid,
-                        "type": "video"
-                    })
-            video_fmts = sorted(
-                [f for f in formats if f['type'] == 'video'],
-                key=lambda x: int(x['label'].replace('p', ''))
-            )
-            audio_fmts = [f for f in formats if f['type'] == 'audio']
-            return jsonify({
-                "title": info.get('title', 'Unknown'),
-                "thumbnail": info.get('thumbnail', ''),
-                "channel": info.get('uploader', 'Unknown'),
-                "duration": info.get('duration_string', '--:--'),
-                "view_count": f"{info.get('view_count', 0):,} views" if info.get('view_count') else '',
-                "formats": audio_fmts + video_fmts
-            })
+        # Get video info from Cobalt
+        res = requests.post(
+            f"{COBALT_API}",
+            json={
+                "url": url,
+                "videoQuality": "720",
+                "audioFormat": "mp3",
+                "downloadMode": "auto",
+            },
+            headers=HEADERS,
+            timeout=30
+        )
+        data_resp = res.json()
+
+        if data_resp.get('status') in ['error', 'rate-limit']:
+            return jsonify({"error": data_resp.get('error', {}).get('code', 'Unknown error')}), 500
+
+        # Extract video ID for thumbnail (YouTube)
+        vid_id = extract_yt_id(url)
+        thumbnail = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg" if vid_id else ""
+
+        # Return available formats
+        formats = [
+            {"label": "MP3", "ext": "mp3", "quality": "mp3", "type": "audio"},
+            {"label": "360p", "ext": "mp4", "quality": "360", "type": "video"},
+            {"label": "720p", "ext": "mp4", "quality": "720", "type": "video"},
+            {"label": "1080p", "ext": "mp4", "quality": "1080", "type": "video"},
+        ]
+
+        return jsonify({
+            "title": extract_title(url),
+            "thumbnail": thumbnail,
+            "channel": "Video",
+            "duration": "--:--",
+            "view_count": "",
+            "formats": formats,
+            "cobalt_url": data_resp.get('url', ''),
+            "status": data_resp.get('status', '')
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -70,50 +75,63 @@ def get_info():
 def download_video():
     data = request.json
     url = data.get('url', '').strip()
-    format_id = data.get('format_id', 'best')
+    quality = data.get('quality', '720')
     fmt_type = data.get('type', 'video')
-    label = data.get('label', 'video')
+    label = data.get('label', '720p')
 
     if not url:
         return jsonify({"error": "URL required"}), 400
 
     try:
-        out_path = os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s')
-
         if fmt_type == 'audio':
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': out_path,
-                'quiet': True,
-                'http_headers': HEADERS,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
+            payload = {
+                "url": url,
+                "downloadMode": "audio",
+                "audioFormat": "mp3",
+                "audioQuality": "128",
             }
         else:
-            ydl_opts = {
-                'format': f'bestvideo[height<={label.replace("p","")}]+bestaudio/best',
-                'outtmpl': out_path,
-                'quiet': True,
-                'http_headers': HEADERS,
-                'merge_output_format': 'mp4',
+            payload = {
+                "url": url,
+                "downloadMode": "auto",
+                "videoQuality": quality,
             }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if fmt_type == 'audio':
-                filename = filename.rsplit('.', 1)[0] + '.mp3'
-            if os.path.exists(filename):
-                return send_file(
-                    filename,
-                    as_attachment=True,
-                    download_name=os.path.basename(filename)
-                )
-            else:
-                return jsonify({"error": "File not found"}), 500
+        res = requests.post(
+            COBALT_API,
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+        data_resp = res.json()
+
+        status = data_resp.get('status')
+
+        if status == 'error':
+            code = data_resp.get('error', {}).get('code', 'Unknown')
+            return jsonify({"error": code}), 500
+
+        if status == 'redirect' or status == 'tunnel':
+            download_url = data_resp.get('url')
+            filename = data_resp.get('filename', f'video.{"mp3" if fmt_type=="audio" else "mp4"}')
+            return jsonify({
+                "download_url": download_url,
+                "filename": filename,
+                "status": "ok"
+            })
+
+        if status == 'picker':
+            # Multiple options - take first
+            picker = data_resp.get('picker', [])
+            if picker:
+                return jsonify({
+                    "download_url": picker[0].get('url'),
+                    "filename": f'video.{"mp3" if fmt_type=="audio" else "mp4"}',
+                    "status": "ok"
+                })
+
+        return jsonify({"error": "Could not get download link"}), 500
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -125,34 +143,47 @@ def get_playlist():
     if not url:
         return jsonify({"error": "URL required"}), 400
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': True,
-        'http_headers': HEADERS,
-    }
+    # Extract playlist ID
+    import re
+    match = re.search(r'list=([a-zA-Z0-9_-]+)', url)
+    if not match:
+        return jsonify({"error": "Invalid playlist URL"}), 400
+
+    playlist_id = match.group(1)
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            entries = info.get('entries', [])
-            videos = []
-            for e in entries[:50]:
-                videos.append({
-                    "id": e.get('id', ''),
-                    "title": e.get('title', 'Unknown'),
-                    "url": e.get('url') or f"https://youtube.com/watch?v={e.get('id', '')}",
-                    "duration": e.get('duration_string', '--:--'),
-                    "thumbnail": f"https://i.ytimg.com/vi/{e.get('id', '')}/default.jpg"
-                })
-            return jsonify({
-                "title": info.get('title', 'Playlist'),
-                "thumbnail": info.get('thumbnail') or (videos[0]['thumbnail'] if videos else ''),
-                "count": len(videos),
-                "videos": videos
-            })
+        # Use YouTube oEmbed for basic info
+        videos = []
+        return jsonify({
+            "title": "YouTube Playlist",
+            "thumbnail": "",
+            "count": 0,
+            "videos": videos,
+            "message": "Playlist feature coming soon"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def extract_yt_id(url):
+    import re
+    match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+    return match.group(1) if match else None
+
+
+def extract_title(url):
+    try:
+        vid_id = extract_yt_id(url)
+        if vid_id:
+            res = requests.get(
+                f"https://www.youtube.com/oembed?url=https://youtube.com/watch?v={vid_id}&format=json",
+                timeout=10
+            )
+            if res.ok:
+                return res.json().get('title', 'Video')
+    except:
+        pass
+    return 'Video'
 
 
 if __name__ == '__main__':
